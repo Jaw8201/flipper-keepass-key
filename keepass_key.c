@@ -14,6 +14,7 @@
  *   - Per-installation 160-bit HMAC key generation.
  *   - Separate persistent HMAC credential storage.
  *   - Provisioning migration for existing demo installations.
+ *   - Authenticated recovery-key display for offline backup.
  *
  * SECURITY NOTE:
  * This is still development software. The saved directional sequence is local
@@ -45,6 +46,8 @@ typedef enum {
     AppModeLocked,
     AppModeIncorrect,
     AppModeAuthorized,
+    AppModeRecoveryWarning,
+    AppModeRecoveryDisplay,
 } AppMode;
 
 typedef struct {
@@ -429,6 +432,9 @@ typedef struct {
      * Kept in RAM only while the app is running and cleared during cleanup.
      */
     uint8_t hmac_key[HMAC_KEY_SIZE];
+
+    /** Which half of the recovery key is currently displayed (0 or 1). */
+    uint8_t recovery_page;
 } KeePassKeyApp;
 
 /* --------------------------------------------------------------------------
@@ -609,6 +615,50 @@ static void draw_progress(Canvas* canvas, uint8_t entered, uint8_t total) {
     canvas_draw_str(canvas, 24, 47, buffer);
 }
 
+
+/* --------------------------------------------------------------------------
+ * Recovery Key Helpers
+ * -------------------------------------------------------------------------- */
+
+/**
+ * Convert one byte to two uppercase hexadecimal characters.
+ */
+static void byte_to_hex(uint8_t value, char* output) {
+    static const char hex[] = "0123456789ABCDEF";
+    output[0] = hex[(value >> 4U) & 0x0FU];
+    output[1] = hex[value & 0x0FU];
+}
+
+/**
+ * Format ten bytes of the credential as five four-character groups.
+ *
+ * Splitting the 40-character recovery value over two pages keeps it readable
+ * on the Flipper display and makes manual transcription less error-prone.
+ */
+static void format_recovery_page(
+    const uint8_t key[HMAC_KEY_SIZE],
+    uint8_t page,
+    char output[25]) {
+
+    const uint8_t offset = (uint8_t)(page * 10U);
+    size_t position = 0U;
+
+    for(uint8_t group = 0U; group < 5U; group++) {
+        for(uint8_t byte = 0U; byte < 2U; byte++) {
+            byte_to_hex(
+                key[offset + (group * 2U) + byte],
+                &output[position]);
+            position += 2U;
+        }
+
+        if(group < 4U) {
+            output[position++] = ' ';
+        }
+    }
+
+    output[position] = '\0';
+}
+
 /* --------------------------------------------------------------------------
  * User Interface
  * -------------------------------------------------------------------------- */
@@ -643,6 +693,49 @@ static void draw_callback(Canvas* canvas, void* context) {
         return;
     }
 
+    if(app->mode == AppModeRecoveryWarning) {
+        canvas_draw_str(canvas, 25, 25, "RECOVERY KEY");
+        canvas_draw_str(canvas, 8, 38, "Anyone with it can");
+        canvas_draw_str(canvas, 12, 49, "clone your device");
+        canvas_draw_str(canvas, 5, 62, "Hold OK show  BACK");
+        return;
+    }
+
+    if(app->mode == AppModeRecoveryDisplay) {
+        char recovery[25];
+        format_recovery_page(
+            app->hmac_key,
+            app->recovery_page,
+            recovery);
+
+        canvas_draw_str(canvas, 20, 24, "RECOVERY KEY");
+
+        char page_label[16];
+        snprintf(
+            page_label,
+            sizeof(page_label),
+            "Part %u of 2",
+            (unsigned int)(app->recovery_page + 1U));
+        canvas_draw_str(canvas, 42, 36, page_label);
+
+        /*
+         * Use the small font so five grouped hexadecimal blocks fit on one
+         * line without exposing the value elsewhere in the interface.
+         */
+        canvas_set_font(canvas, FontKeyboard);
+        canvas_draw_str(canvas, 2, 49, recovery);
+        canvas_set_font(canvas, FontSecondary);
+
+        canvas_draw_str(
+            canvas,
+            7,
+            62,
+            app->recovery_page == 0U ?
+                "OK next  BACK hide" :
+                "OK done  BACK hide");
+        return;
+    }
+
     if(app->mode == AppModeAuthorized) {
         canvas_draw_str(canvas, 37, 24, "AUTHORIZED");
 
@@ -658,7 +751,7 @@ static void draw_callback(Canvas* canvas, void* context) {
             50,
             app->hmac_self_test_passed ? "HMAC TEST: PASS" : "HMAC TEST: FAIL");
 
-        canvas_draw_str(canvas, 27, 63, "BACK to relock");
+        canvas_draw_str(canvas, 6, 63, "Hold OK recovery  BACK");
         return;
     }
 
@@ -786,7 +879,9 @@ int32_t keepass_key_app(void* p) {
     bool running = true;
 
     while(running) {
-        if(app->mode == AppModeAuthorized) {
+        if(app->mode == AppModeAuthorized ||
+           app->mode == AppModeRecoveryWarning ||
+           app->mode == AppModeRecoveryDisplay) {
             const int32_t remaining =
                 (int32_t)(app->authorized_until - furi_get_tick());
 
@@ -807,7 +902,68 @@ int32_t keepass_key_app(void* p) {
             continue;
         }
 
-        if(event.type != InputTypeShort) {
+        /*
+         * Recovery disclosure deliberately uses a long OK press. Normal
+         * navigation and authentication continue to use short presses.
+         */
+        const bool short_press = event.type == InputTypeShort;
+        const bool long_press = event.type == InputTypeLong;
+
+        if(!short_press && !long_press) {
+            continue;
+        }
+
+        /*
+         * Enter the recovery warning only from an already-authorized state.
+         * A long press avoids accidental disclosure during normal use.
+         */
+        if(app->mode == AppModeAuthorized &&
+           event.key == InputKeyOk &&
+           long_press &&
+           app->hmac_key_provisioned) {
+            app->mode = AppModeRecoveryWarning;
+            view_port_update(app->viewport);
+            continue;
+        }
+
+        /*
+         * The warning requires a second deliberate long OK press before any
+         * credential bytes are placed on screen.
+         */
+        if(app->mode == AppModeRecoveryWarning) {
+            if(event.key == InputKeyBack && short_press) {
+                app->mode = AppModeAuthorized;
+            } else if(event.key == InputKeyOk && long_press) {
+                app->recovery_page = 0U;
+                app->mode = AppModeRecoveryDisplay;
+            }
+
+            view_port_update(app->viewport);
+            continue;
+        }
+
+        /*
+         * Recovery data is visible only in this state. BACK hides it
+         * immediately; OK advances through the two halves and then hides it.
+         */
+        if(app->mode == AppModeRecoveryDisplay) {
+            if(event.key == InputKeyBack && short_press) {
+                app->recovery_page = 0U;
+                app->mode = AppModeAuthorized;
+            } else if(event.key == InputKeyOk && short_press) {
+                if(app->recovery_page == 0U) {
+                    app->recovery_page = 1U;
+                } else {
+                    app->recovery_page = 0U;
+                    app->mode = AppModeAuthorized;
+                }
+            }
+
+            view_port_update(app->viewport);
+            continue;
+        }
+
+        if(!short_press) {
             continue;
         }
 
