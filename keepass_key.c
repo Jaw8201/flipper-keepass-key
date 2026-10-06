@@ -11,6 +11,9 @@
  *   - Persistent progressive failed-attempt protection.
  *   - 30-second temporary authorization window.
  *   - RFC 2202 HMAC-SHA1 self-test.
+ *   - Per-installation 160-bit HMAC key generation.
+ *   - Separate persistent HMAC credential storage.
+ *   - Provisioning migration for existing demo installations.
  *
  * SECURITY NOTE:
  * This is still development software. The saved directional sequence is local
@@ -22,6 +25,7 @@
 #include <gui/gui.h>
 #include <input/input.h>
 #include <storage/storage.h>
+#include <furi_hal_random.h>
 
 #define MIN_SEQUENCE_LENGTH 8U
 #define MAX_SEQUENCE_LENGTH 32U
@@ -30,6 +34,10 @@
 #define STATE_DIR EXT_PATH("apps_data/keepass_key")
 #define STATE_PATH EXT_PATH("apps_data/keepass_key/state.bin")
 #define STATE_VERSION 2U
+
+#define KEY_PATH EXT_PATH("apps_data/keepass_key/hmac_key.bin")
+#define KEY_VERSION 1U
+#define HMAC_KEY_SIZE 20U
 
 typedef enum {
     AppModeSetupCreate,
@@ -285,6 +293,112 @@ static bool hmac_sha1_self_test(void) {
 }
 
 
+
+/* --------------------------------------------------------------------------
+ * Provisioned HMAC Key
+ * -------------------------------------------------------------------------- */
+
+/**
+ * On-disk representation of the device's HMAC credential.
+ *
+ * The credential is deliberately stored separately from state.bin. This makes
+ * the distinction between local authorization data and KeePass cryptographic
+ * key material explicit and allows recovery/reset handling to evolve without
+ * changing the ordinary authentication-state format.
+ *
+ * SECURITY LIMITATION:
+ * This is a development implementation stored on the microSD card. The
+ * Flipper Zero does not provide a general-purpose secure element for arbitrary
+ * application secrets, so physical access to the storage may expose this key.
+ */
+typedef struct {
+    uint8_t version;
+    uint8_t key[HMAC_KEY_SIZE];
+} KeePassKeyCredential;
+
+/**
+ * Load a previously provisioned HMAC key.
+ *
+ * Returns false if the credential file is absent, malformed, or incompatible.
+ * The caller can then treat the installation as not yet provisioned.
+ */
+static bool load_hmac_key(uint8_t key[HMAC_KEY_SIZE]) {
+    bool valid = false;
+
+    Storage* storage = furi_record_open(RECORD_STORAGE);
+    File* file = storage_file_alloc(storage);
+
+    if(storage_file_open(file, KEY_PATH, FSAM_READ, FSOM_OPEN_EXISTING)) {
+        KeePassKeyCredential credential = {0};
+        const uint16_t bytes_read =
+            storage_file_read(file, &credential, sizeof(credential));
+
+        if(bytes_read == sizeof(credential) &&
+           credential.version == KEY_VERSION) {
+            memcpy(key, credential.key, HMAC_KEY_SIZE);
+            valid = true;
+        }
+
+        memset(&credential, 0, sizeof(credential));
+        storage_file_close(file);
+    }
+
+    storage_file_free(file);
+    furi_record_close(RECORD_STORAGE);
+    return valid;
+}
+
+/**
+ * Persist a newly generated HMAC credential.
+ *
+ * The file is replaced atomically from the application's point of view: a
+ * provisioning attempt either writes the complete fixed-size structure or a
+ * later load treats it as invalid.
+ */
+static bool save_hmac_key(const uint8_t key[HMAC_KEY_SIZE]) {
+    bool saved = false;
+
+    Storage* storage = furi_record_open(RECORD_STORAGE);
+    storage_common_mkdir(storage, STATE_DIR);
+
+    File* file = storage_file_alloc(storage);
+
+    if(storage_file_open(file, KEY_PATH, FSAM_WRITE, FSOM_CREATE_ALWAYS)) {
+        KeePassKeyCredential credential = {0};
+        credential.version = KEY_VERSION;
+        memcpy(credential.key, key, HMAC_KEY_SIZE);
+
+        const uint16_t bytes_written =
+            storage_file_write(file, &credential, sizeof(credential));
+
+        saved = (bytes_written == sizeof(credential));
+
+        memset(&credential, 0, sizeof(credential));
+        storage_file_close(file);
+    }
+
+    storage_file_free(file);
+    furi_record_close(RECORD_STORAGE);
+    return saved;
+}
+
+/**
+ * Generate and persist a fresh 160-bit HMAC-SHA1 key.
+ *
+ * Random bytes come directly from Flipper's hardware abstraction layer. The
+ * generated key is never displayed, logged, or compiled into the application.
+ */
+static bool provision_hmac_key(uint8_t key[HMAC_KEY_SIZE]) {
+    furi_hal_random_fill_buf(key, HMAC_KEY_SIZE);
+
+    if(!save_hmac_key(key)) {
+        memset(key, 0, HMAC_KEY_SIZE);
+        return false;
+    }
+
+    return true;
+}
+
 /* --------------------------------------------------------------------------
  * Runtime Application State
  * -------------------------------------------------------------------------- */
@@ -306,6 +420,15 @@ typedef struct {
     uint8_t entry_length;
 
     bool hmac_self_test_passed;
+
+    /** True when a valid installation-specific HMAC credential is loaded. */
+    bool hmac_key_provisioned;
+
+    /**
+     * Installation-specific HMAC credential.
+     * Kept in RAM only while the app is running and cleared during cleanup.
+     */
+    uint8_t hmac_key[HMAC_KEY_SIZE];
 } KeePassKeyApp;
 
 /* --------------------------------------------------------------------------
@@ -521,13 +644,21 @@ static void draw_callback(Canvas* canvas, void* context) {
     }
 
     if(app->mode == AppModeAuthorized) {
-        canvas_draw_str(canvas, 37, 27, "AUTHORIZED");
+        canvas_draw_str(canvas, 37, 24, "AUTHORIZED");
+
         canvas_draw_str(
             canvas,
             24,
-            43,
+            38,
+            app->hmac_key_provisioned ? "KEY: PROVISIONED" : "KEY: MISSING");
+
+        canvas_draw_str(
+            canvas,
+            24,
+            50,
             app->hmac_self_test_passed ? "HMAC TEST: PASS" : "HMAC TEST: FAIL");
-        canvas_draw_str(canvas, 27, 61, "BACK to relock");
+
+        canvas_draw_str(canvas, 27, 63, "BACK to relock");
         return;
     }
 
@@ -593,6 +724,16 @@ static void begin_authorization(KeePassKeyApp* app) {
     app->failures = 0U;
     save_state(app);
 
+    /*
+     * Migration path for users of the previous demo build: if local setup
+     * already exists but no credential has been created yet, provision it only
+     * after a successful local authentication.
+     */
+    if(!app->hmac_key_provisioned) {
+        app->hmac_key_provisioned =
+            provision_hmac_key(app->hmac_key);
+    }
+
     const uint32_t auth_ticks =
         (AUTH_TIMEOUT_MS * furi_kernel_get_tick_frequency()) / 1000U;
 
@@ -616,6 +757,7 @@ int32_t keepass_key_app(void* p) {
     memset(app, 0, sizeof(KeePassKeyApp));
 
     app->hmac_self_test_passed = hmac_sha1_self_test();
+    app->hmac_key_provisioned = load_hmac_key(app->hmac_key);
 
     const bool provisioned = load_state(app);
 
@@ -709,6 +851,16 @@ int32_t keepass_key_app(void* p) {
                            app->sequence_length)) {
                         app->failures = 0U;
                         save_state(app);
+
+                        /*
+                         * First-run provisioning happens only after the user
+                         * has successfully confirmed their local sequence.
+                         */
+                        if(!app->hmac_key_provisioned) {
+                            app->hmac_key_provisioned =
+                                provision_hmac_key(app->hmac_key);
+                        }
+
                         clear_entry(app);
                         app->mode = AppModeLocked;
                     } else {
@@ -784,6 +936,7 @@ int32_t keepass_key_app(void* p) {
     view_port_free(app->viewport);
     furi_message_queue_free(app->input_queue);
 
+    memset(app->hmac_key, 0, sizeof(app->hmac_key));
     memset(app->sequence, 0, sizeof(app->sequence));
     memset(app->entry, 0, sizeof(app->entry));
     memset(app, 0, sizeof(KeePassKeyApp));
