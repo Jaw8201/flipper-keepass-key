@@ -14,9 +14,10 @@
  *   - Per-installation 160-bit HMAC key generation.
  *   - Separate persistent HMAC credential storage.
  *   - Provisioning migration for existing demo installations.
- *   - Authenticated recovery-key display for offline backup.
+ *   - Authenticated recovery-key display using non-clipping two-line pages.
  *   - Manual recovery-key import for replacement/reprovisioned devices.
  *   - Short non-secret fingerprint for recovery verification.
+ *   - Five-minute inactivity timeout while viewing or restoring a recovery key.
  *
  * SECURITY NOTE:
  * This is still development software. The saved directional sequence is local
@@ -33,6 +34,7 @@
 #define MIN_SEQUENCE_LENGTH 8U
 #define MAX_SEQUENCE_LENGTH 32U
 #define AUTH_TIMEOUT_MS 30000U
+#define RECOVERY_TIMEOUT_MS 300000U
 
 #define STATE_DIR EXT_PATH("apps_data/keepass_key")
 #define STATE_PATH EXT_PATH("apps_data/keepass_key/state.bin")
@@ -685,23 +687,32 @@ static void byte_to_hex(uint8_t value, char* output) {
  * Splitting the 40-character recovery value over two pages keeps it readable
  * on the Flipper display and makes manual transcription less error-prone.
  */
-static void format_recovery_page(
+static void format_recovery_line(
     const uint8_t key[HMAC_KEY_SIZE],
     uint8_t page,
-    char output[25]) {
+    uint8_t line,
+    char output[13]) {
 
-    const uint8_t offset = (uint8_t)(page * 10U);
+    /*
+     * Each page contains ten bytes (20 hex characters), split across two
+     * deliberately short lines. Each line represents five bytes / ten hex
+     * characters and is formatted as:
+     *
+     *     XXXX XXXX XX
+     *
+     * This avoids relying on the full 128-pixel display width and makes
+     * clipping immediately obvious.
+     */
+    const uint8_t byte_offset =
+        (uint8_t)((page * 10U) + (line * 5U));
+
     size_t position = 0U;
 
-    for(uint8_t group = 0U; group < 5U; group++) {
-        for(uint8_t byte = 0U; byte < 2U; byte++) {
-            byte_to_hex(
-                key[offset + (group * 2U) + byte],
-                &output[position]);
-            position += 2U;
-        }
+    for(uint8_t i = 0U; i < 5U; i++) {
+        byte_to_hex(key[byte_offset + i], &output[position]);
+        position += 2U;
 
-        if(group < 4U) {
+        if(i == 1U || i == 3U) {
             output[position++] = ' ';
         }
     }
@@ -720,6 +731,20 @@ static void clear_recovery_import(KeePassKeyApp* app) {
     memset(app->recovery_import, 0, sizeof(app->recovery_import));
     app->recovery_import_length = 0U;
     app->recovery_import_digit = 0U;
+}
+
+/**
+ * Give recovery viewing/import its own five-minute inactivity window.
+ *
+ * Normal authorization remains limited to 30 seconds. Recovery operations need
+ * longer because the user may be carefully transcribing or entering forty
+ * hexadecimal characters. Relevant button presses refresh this deadline.
+ */
+static void refresh_recovery_timeout(KeePassKeyApp* app) {
+    const uint32_t timeout_ticks =
+        (RECOVERY_TIMEOUT_MS * furi_kernel_get_tick_frequency()) / 1000U;
+
+    app->authorized_until = furi_get_tick() + timeout_ticks;
 }
 
 /**
@@ -835,37 +860,51 @@ static void draw_callback(Canvas* canvas, void* context) {
     }
 
     if(app->mode == AppModeRecoveryDisplay) {
-        char recovery[25];
-        format_recovery_page(
+        char recovery_line_1[13];
+        char recovery_line_2[13];
+
+        format_recovery_line(
             app->hmac_key,
             app->recovery_page,
-            recovery);
+            0U,
+            recovery_line_1);
+        format_recovery_line(
+            app->hmac_key,
+            app->recovery_page,
+            1U,
+            recovery_line_2);
 
-        canvas_draw_str(canvas, 20, 24, "RECOVERY KEY");
-
-        char page_label[16];
+        char page_label[20];
         snprintf(
             page_label,
             sizeof(page_label),
-            "Part %u of 2",
+            "PART %u OF 2",
             (unsigned int)(app->recovery_page + 1U));
-        canvas_draw_str(canvas, 42, 36, page_label);
+
+        canvas_draw_str(canvas, 20, 19, "RECOVERY KEY");
+        canvas_draw_str(canvas, 39, 30, page_label);
 
         /*
-         * Use the small font so five grouped hexadecimal blocks fit on one
-         * line without exposing the value elsewhere in the interface.
+         * Two short fixed-width-ish rows are intentionally used instead of
+         * attempting to fit all 20 hex characters on one line. Every page
+         * therefore exposes exactly 20 characters: ten on each row.
          */
         canvas_set_font(canvas, FontKeyboard);
-        canvas_draw_str(canvas, 2, 49, recovery);
+        canvas_draw_str(canvas, 25, 43, recovery_line_1);
+        canvas_draw_str(canvas, 25, 53, recovery_line_2);
         canvas_set_font(canvas, FontSecondary);
 
         canvas_draw_str(
             canvas,
             7,
-            62,
+            64,
             app->recovery_page == 0U ?
                 "OK next  BACK hide" :
                 "OK done  BACK hide");
+
+        memset(recovery_line_1, 0, sizeof(recovery_line_1));
+        memset(recovery_line_2, 0, sizeof(recovery_line_2));
+        memset(page_label, 0, sizeof(page_label));
         return;
     }
 
@@ -1073,6 +1112,7 @@ int32_t keepass_key_app(void* p) {
                 }
             } else if(event.key == InputKeyDown) {
                 clear_recovery_import(app);
+                refresh_recovery_timeout(app);
                 app->mode = AppModeRecoveryImport;
             } else if(event.key == InputKeyBack) {
                 app->authorized_until = 0U;
@@ -1090,6 +1130,13 @@ int32_t keepass_key_app(void* p) {
          * is not echoed back to the screen.
          */
         if(app->mode == AppModeRecoveryImport && short_press) {
+            if(event.key == InputKeyUp ||
+               event.key == InputKeyDown ||
+               event.key == InputKeyBack ||
+               event.key == InputKeyOk) {
+                refresh_recovery_timeout(app);
+            }
+
             if(event.key == InputKeyUp) {
                 app->recovery_import_digit =
                     (uint8_t)((app->recovery_import_digit + 1U) & 0x0FU);
@@ -1144,6 +1191,7 @@ int32_t keepass_key_app(void* p) {
            event.key == InputKeyOk &&
            long_press &&
            app->hmac_key_provisioned) {
+            refresh_recovery_timeout(app);
             app->mode = AppModeRecoveryWarning;
             view_port_update(app->viewport);
             continue;
@@ -1156,7 +1204,13 @@ int32_t keepass_key_app(void* p) {
         if(app->mode == AppModeRecoveryWarning) {
             if(event.key == InputKeyBack && short_press) {
                 app->mode = AppModeAuthorized;
+
+                /* Returning to normal authorization restores its 30s window. */
+                const uint32_t auth_ticks =
+                    (AUTH_TIMEOUT_MS * furi_kernel_get_tick_frequency()) / 1000U;
+                app->authorized_until = furi_get_tick() + auth_ticks;
             } else if(event.key == InputKeyOk && long_press) {
+                refresh_recovery_timeout(app);
                 app->recovery_page = 0U;
                 app->mode = AppModeRecoveryDisplay;
             }
@@ -1170,15 +1224,28 @@ int32_t keepass_key_app(void* p) {
          * immediately; OK advances through the two halves and then hides it.
          */
         if(app->mode == AppModeRecoveryDisplay) {
+            if((event.key == InputKeyBack || event.key == InputKeyOk) &&
+               short_press) {
+                refresh_recovery_timeout(app);
+            }
+
             if(event.key == InputKeyBack && short_press) {
                 app->recovery_page = 0U;
                 app->mode = AppModeAuthorized;
+
+                const uint32_t auth_ticks =
+                    (AUTH_TIMEOUT_MS * furi_kernel_get_tick_frequency()) / 1000U;
+                app->authorized_until = furi_get_tick() + auth_ticks;
             } else if(event.key == InputKeyOk && short_press) {
                 if(app->recovery_page == 0U) {
                     app->recovery_page = 1U;
                 } else {
                     app->recovery_page = 0U;
                     app->mode = AppModeAuthorized;
+
+                    const uint32_t auth_ticks =
+                        (AUTH_TIMEOUT_MS * furi_kernel_get_tick_frequency()) / 1000U;
+                    app->authorized_until = furi_get_tick() + auth_ticks;
                 }
             }
 
