@@ -31,6 +31,7 @@
 #include <input/input.h>
 #include <storage/storage.h>
 #include <furi_hal_random.h>
+#include <cli/cli.h>
 
 #define MIN_SEQUENCE_LENGTH 8U
 #define MAX_SEQUENCE_LENGTH 32U
@@ -708,6 +709,119 @@ static void make_dev_response_id(
     memset(response, 0, sizeof(response));
 }
 
+
+/* --------------------------------------------------------------------------
+ * USB Development Challenge-Response
+ * -------------------------------------------------------------------------- */
+
+#define USB_CHALLENGE_MAX_SIZE 64U
+
+/**
+ * Convert a single hexadecimal character to a nibble.
+ */
+static bool hex_to_nibble(char c, uint8_t* value) {
+    if(c >= '0' && c <= '9') {
+        *value = (uint8_t)(c - '0');
+        return true;
+    }
+
+    if(c >= 'A' && c <= 'F') {
+        *value = (uint8_t)(c - 'A' + 10);
+        return true;
+    }
+
+    if(c >= 'a' && c <= 'f') {
+        *value = (uint8_t)(c - 'a' + 10);
+        return true;
+    }
+
+    return false;
+}
+
+/**
+ * CLI command used only for the development transport test.
+ *
+ * Usage from the Flipper serial CLI:
+ *
+ *     keepass_challenge 001122AABB...
+ *
+ * The host supplies an arbitrary hexadecimal challenge. The command computes
+ * HMAC-SHA1 with the provisioned device credential and returns the complete
+ * 20-byte response as 40 hexadecimal characters.
+ *
+ * The key is never printed or copied to the host.
+ */
+static void keepass_challenge_cli(PipeSide* pipe, FuriString* args, void* context) {
+    UNUSED(pipe);
+
+    KeePassKeyApp* app = context;
+
+    if(!app->hmac_key_provisioned) {
+        printf("ERR key_missing\r\n");
+        return;
+    }
+
+    const char* input = furi_string_get_cstr(args);
+
+    while(*input == ' ' || *input == '\t') {
+        input++;
+    }
+
+    size_t hex_length = strlen(input);
+
+    while(hex_length > 0U &&
+          (input[hex_length - 1U] == ' ' ||
+           input[hex_length - 1U] == '\t' ||
+           input[hex_length - 1U] == '\r' ||
+           input[hex_length - 1U] == '\n')) {
+        hex_length--;
+    }
+
+    if(hex_length == 0U ||
+       (hex_length & 1U) != 0U ||
+       hex_length > (USB_CHALLENGE_MAX_SIZE * 2U)) {
+        printf("ERR challenge_length\r\n");
+        return;
+    }
+
+    uint8_t challenge[USB_CHALLENGE_MAX_SIZE];
+    uint8_t response[SHA1_DIGEST_SIZE];
+    memset(challenge, 0, sizeof(challenge));
+    memset(response, 0, sizeof(response));
+
+    const size_t challenge_length = hex_length / 2U;
+
+    for(size_t i = 0U; i < challenge_length; i++) {
+        uint8_t high;
+        uint8_t low;
+
+        if(!hex_to_nibble(input[i * 2U], &high) ||
+           !hex_to_nibble(input[(i * 2U) + 1U], &low)) {
+            printf("ERR invalid_hex\r\n");
+            memset(challenge, 0, sizeof(challenge));
+            return;
+        }
+
+        challenge[i] = (uint8_t)((high << 4U) | low);
+    }
+
+    hmac_sha1(
+        app->hmac_key,
+        HMAC_KEY_SIZE,
+        challenge,
+        challenge_length,
+        response);
+
+    printf("OK ");
+    for(size_t i = 0U; i < SHA1_DIGEST_SIZE; i++) {
+        printf("%02X", response[i]);
+    }
+    printf("\r\n");
+
+    memset(challenge, 0, sizeof(challenge));
+    memset(response, 0, sizeof(response));
+}
+
 /* --------------------------------------------------------------------------
  * Recovery Key Helpers
  * -------------------------------------------------------------------------- */
@@ -1121,6 +1235,19 @@ int32_t keepass_key_app(void* p) {
     Gui* gui = furi_record_open(RECORD_GUI);
     gui_add_view_port(gui, app->viewport, GuiLayerFullscreen);
 
+    /*
+     * Temporary development transport: expose a serial CLI command while this
+     * app is running. This proves PC -> Flipper -> PC challenge-response before
+     * implementing the final KeePassXC/YubiKey-compatible transport.
+     */
+    CliRegistry* cli_registry = furi_record_open(RECORD_CLI);
+    cli_registry_add_command(
+        cli_registry,
+        "keepass_challenge",
+        CliCommandFlagParallelSafe,
+        keepass_challenge_cli,
+        app);
+
     bool running = true;
 
     while(running) {
@@ -1483,6 +1610,9 @@ int32_t keepass_key_app(void* p) {
     memset(app->sequence, 0, sizeof(app->sequence));
     memset(app->entry, 0, sizeof(app->entry));
     memset(app, 0, sizeof(KeePassKeyApp));
+    cli_registry_delete_command(cli_registry, "keepass_challenge");
+    furi_record_close(RECORD_CLI);
+
     free(app);
 
     return 0;
