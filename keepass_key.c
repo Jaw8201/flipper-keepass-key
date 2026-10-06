@@ -18,6 +18,7 @@
  *   - Manual recovery-key import for replacement/reprovisioned devices.
  *   - Short non-secret fingerprint for recovery verification.
  *   - Five-minute inactivity timeout while viewing or restoring a recovery key.
+ *   - Development challenge-response using the provisioned HMAC credential.
  *
  * SECURITY NOTE:
  * This is still development software. The saved directional sequence is local
@@ -52,6 +53,7 @@ typedef enum {
     AppModeAuthorized,
     AppModeRecoveryWarning,
     AppModeRecoveryDisplay,
+    AppModeDevHmacTest,
     AppModeProvisionChoice,
     AppModeRecoveryImport,
     AppModeRecoveryImported,
@@ -668,6 +670,44 @@ static void make_key_fingerprint(
     memset(digest, 0, sizeof(digest));
 }
 
+
+
+/* --------------------------------------------------------------------------
+ * Development Challenge-Response Test
+ * -------------------------------------------------------------------------- */
+
+/**
+ * Calculate a deterministic HMAC-SHA1 response using the REAL provisioned key.
+ *
+ * The fixed challenge is public development data. Only the first four bytes
+ * of the response are shown, which is enough to compare independently on the
+ * PC without exposing the device credential.
+ */
+static void make_dev_response_id(
+    const uint8_t key[HMAC_KEY_SIZE],
+    char output[9]) {
+
+    static const uint8_t challenge[] =
+        "KeePass Key development challenge v1";
+    uint8_t response[SHA1_DIGEST_SIZE];
+
+    hmac_sha1(
+        key,
+        HMAC_KEY_SIZE,
+        challenge,
+        sizeof(challenge) - 1U,
+        response);
+
+    static const char hex[] = "0123456789ABCDEF";
+    for(uint8_t i = 0U; i < 4U; i++) {
+        output[i * 2U] = hex[(response[i] >> 4U) & 0x0FU];
+        output[(i * 2U) + 1U] = hex[response[i] & 0x0FU];
+    }
+    output[8] = '\0';
+
+    memset(response, 0, sizeof(response));
+}
+
 /* --------------------------------------------------------------------------
  * Recovery Key Helpers
  * -------------------------------------------------------------------------- */
@@ -908,6 +948,30 @@ static void draw_callback(Canvas* canvas, void* context) {
         return;
     }
 
+    if(app->mode == AppModeDevHmacTest) {
+        char response_id[9];
+        char response_line[24];
+
+        make_dev_response_id(app->hmac_key, response_id);
+        snprintf(
+            response_line,
+            sizeof(response_line),
+            "RESULT: %s",
+            response_id);
+
+        /*
+         * This is deliberately a temporary, sparse test screen. It does not
+         * alter the normal authorised UI.
+         */
+        canvas_draw_str(canvas, 31, 20, "HMAC TEST");
+        canvas_draw_str(canvas, 29, 39, response_line);
+        canvas_draw_str(canvas, 17, 59, "OK return  BACK relock");
+
+        memset(response_id, 0, sizeof(response_id));
+        memset(response_line, 0, sizeof(response_line));
+        return;
+    }
+
     if(app->mode == AppModeAuthorized) {
         canvas_draw_str(canvas, 37, 20, "AUTHORIZED");
 
@@ -1061,6 +1125,7 @@ int32_t keepass_key_app(void* p) {
 
     while(running) {
         if(app->mode == AppModeAuthorized ||
+           app->mode == AppModeDevHmacTest ||
            app->mode == AppModeRecoveryWarning ||
            app->mode == AppModeRecoveryDisplay ||
            app->mode == AppModeProvisionChoice ||
@@ -1189,9 +1254,19 @@ int32_t keepass_key_app(void* p) {
          */
         if(app->mode == AppModeAuthorized &&
            event.key == InputKeyOk &&
+           short_press &&
+           app->hmac_key_provisioned) {
+            app->mode = AppModeDevHmacTest;
+            view_port_update(app->viewport);
+            continue;
+        }
+
+        if(app->mode == AppModeAuthorized &&
+           event.key == InputKeyOk &&
            long_press &&
            app->hmac_key_provisioned) {
             refresh_recovery_timeout(app);
+            app->recovery_page = 0U;
             app->mode = AppModeRecoveryWarning;
             view_port_update(app->viewport);
             continue;
@@ -1201,6 +1276,24 @@ int32_t keepass_key_app(void* p) {
          * The warning requires a second deliberate long OK press before any
          * credential bytes are placed on screen.
          */
+        if(app->mode == AppModeDevHmacTest) {
+            if(event.key == InputKeyOk && short_press) {
+                /*
+                 * Return to the normal authorised screen with a fresh normal
+                 * authorization window.
+                 */
+                const uint32_t auth_ticks =
+                    (AUTH_TIMEOUT_MS * furi_kernel_get_tick_frequency()) / 1000U;
+                app->authorized_until = furi_get_tick() + auth_ticks;
+                app->mode = AppModeAuthorized;
+            } else if(event.key == InputKeyBack && short_press) {
+                begin_authorization(app);
+            }
+
+            view_port_update(app->viewport);
+            continue;
+        }
+
         if(app->mode == AppModeRecoveryWarning) {
             if(event.key == InputKeyBack && short_press) {
                 app->mode = AppModeAuthorized;
