@@ -15,6 +15,7 @@
  *   - Separate persistent HMAC credential storage.
  *   - Provisioning migration for existing demo installations.
  *   - Authenticated recovery-key display for offline backup.
+ *   - Manual recovery-key import for replacement/reprovisioned devices.
  *
  * SECURITY NOTE:
  * This is still development software. The saved directional sequence is local
@@ -48,6 +49,9 @@ typedef enum {
     AppModeAuthorized,
     AppModeRecoveryWarning,
     AppModeRecoveryDisplay,
+    AppModeProvisionChoice,
+    AppModeRecoveryImport,
+    AppModeRecoveryImported,
 } AppMode;
 
 typedef struct {
@@ -435,6 +439,14 @@ typedef struct {
 
     /** Which half of the recovery key is currently displayed (0 or 1). */
     uint8_t recovery_page;
+
+    /**
+     * Temporary recovery-import buffer.
+     * Each entry is one hexadecimal nibble (0-15), not an ASCII character.
+     */
+    uint8_t recovery_import[HMAC_KEY_SIZE * 2U];
+    uint8_t recovery_import_length;
+    uint8_t recovery_import_digit;
 } KeePassKeyApp;
 
 /* --------------------------------------------------------------------------
@@ -659,6 +671,51 @@ static void format_recovery_page(
     output[position] = '\0';
 }
 
+/** Return the printable hexadecimal character for a nibble value. */
+static char hex_digit_char(uint8_t value) {
+    static const char hex[] = "0123456789ABCDEF";
+    return hex[value & 0x0FU];
+}
+
+/** Clear all temporary recovery-import material from RAM. */
+static void clear_recovery_import(KeePassKeyApp* app) {
+    memset(app->recovery_import, 0, sizeof(app->recovery_import));
+    app->recovery_import_length = 0U;
+    app->recovery_import_digit = 0U;
+}
+
+/**
+ * Convert the forty entered hexadecimal nibbles into the twenty-byte HMAC key.
+ *
+ * The temporary decoded key is saved using the same credential format as a
+ * locally generated key. It is copied into the live application state only
+ * after the persistent write succeeds.
+ */
+static bool finish_recovery_import(KeePassKeyApp* app) {
+    if(app->recovery_import_length != (HMAC_KEY_SIZE * 2U)) {
+        return false;
+    }
+
+    uint8_t restored_key[HMAC_KEY_SIZE];
+
+    for(uint8_t i = 0U; i < HMAC_KEY_SIZE; i++) {
+        restored_key[i] =
+            (uint8_t)((app->recovery_import[i * 2U] << 4U) |
+                      app->recovery_import[(i * 2U) + 1U]);
+    }
+
+    const bool saved = save_hmac_key(restored_key);
+
+    if(saved) {
+        memcpy(app->hmac_key, restored_key, HMAC_KEY_SIZE);
+        app->hmac_key_provisioned = true;
+    }
+
+    memset(restored_key, 0, sizeof(restored_key));
+    clear_recovery_import(app);
+    return saved;
+}
+
 /* --------------------------------------------------------------------------
  * User Interface
  * -------------------------------------------------------------------------- */
@@ -690,6 +747,44 @@ static void draw_callback(Canvas* canvas, void* context) {
         canvas_draw_str(canvas, 12, 39, "Enter it once more");
         draw_progress(canvas, app->entry_length, app->sequence_length);
         canvas_draw_str(canvas, 24, 61, "BACK to restart");
+        return;
+    }
+
+    if(app->mode == AppModeProvisionChoice) {
+        canvas_draw_str(canvas, 24, 24, "DEVICE KEY SETUP");
+        canvas_draw_str(canvas, 7, 38, "UP generate new key");
+        canvas_draw_str(canvas, 5, 50, "DOWN restore backup");
+        canvas_draw_str(canvas, 27, 63, "BACK to relock");
+        return;
+    }
+
+    if(app->mode == AppModeRecoveryImport) {
+        char progress[24];
+        char selected[20];
+
+        snprintf(
+            progress,
+            sizeof(progress),
+            "%u / 40 characters",
+            (unsigned int)app->recovery_import_length);
+
+        snprintf(
+            selected,
+            sizeof(selected),
+            "Selected: %c",
+            hex_digit_char(app->recovery_import_digit));
+
+        canvas_draw_str(canvas, 20, 22, "RESTORE KEY");
+        canvas_draw_str(canvas, 18, 35, progress);
+        canvas_draw_str(canvas, 28, 48, selected);
+        canvas_draw_str(canvas, 3, 62, "UP/DN choose OK add");
+        return;
+    }
+
+    if(app->mode == AppModeRecoveryImported) {
+        canvas_draw_str(canvas, 20, 25, "KEY RESTORED");
+        canvas_draw_str(canvas, 8, 41, "Backup saved to device");
+        canvas_draw_str(canvas, 17, 60, "OK continue");
         return;
     }
 
@@ -817,21 +912,12 @@ static void begin_authorization(KeePassKeyApp* app) {
     app->failures = 0U;
     save_state(app);
 
-    /*
-     * Migration path for users of the previous demo build: if local setup
-     * already exists but no credential has been created yet, provision it only
-     * after a successful local authentication.
-     */
-    if(!app->hmac_key_provisioned) {
-        app->hmac_key_provisioned =
-            provision_hmac_key(app->hmac_key);
-    }
-
     const uint32_t auth_ticks =
         (AUTH_TIMEOUT_MS * furi_kernel_get_tick_frequency()) / 1000U;
 
     app->authorized_until = furi_get_tick() + auth_ticks;
-    app->mode = AppModeAuthorized;
+    app->mode =
+        app->hmac_key_provisioned ? AppModeAuthorized : AppModeProvisionChoice;
     clear_entry(app);
 }
 
@@ -881,7 +967,10 @@ int32_t keepass_key_app(void* p) {
     while(running) {
         if(app->mode == AppModeAuthorized ||
            app->mode == AppModeRecoveryWarning ||
-           app->mode == AppModeRecoveryDisplay) {
+           app->mode == AppModeRecoveryDisplay ||
+           app->mode == AppModeProvisionChoice ||
+           app->mode == AppModeRecoveryImport ||
+           app->mode == AppModeRecoveryImported) {
             const int32_t remaining =
                 (int32_t)(app->authorized_until - furi_get_tick());
 
@@ -889,6 +978,7 @@ int32_t keepass_key_app(void* p) {
                 app->authorized_until = 0U;
                 app->mode = AppModeLocked;
                 clear_entry(app);
+                clear_recovery_import(app);
                 view_port_update(app->viewport);
             }
         }
@@ -910,6 +1000,83 @@ int32_t keepass_key_app(void* p) {
         const bool long_press = event.type == InputTypeLong;
 
         if(!short_press && !long_press) {
+            continue;
+        }
+
+        /*
+         * Missing credentials are handled explicitly. UP creates a fresh
+         * random key; DOWN starts restoration from a written recovery key.
+         */
+        if(app->mode == AppModeProvisionChoice && short_press) {
+            if(event.key == InputKeyUp) {
+                app->hmac_key_provisioned =
+                    provision_hmac_key(app->hmac_key);
+
+                if(app->hmac_key_provisioned) {
+                    app->mode = AppModeAuthorized;
+                }
+            } else if(event.key == InputKeyDown) {
+                clear_recovery_import(app);
+                app->mode = AppModeRecoveryImport;
+            } else if(event.key == InputKeyBack) {
+                app->authorized_until = 0U;
+                clear_recovery_import(app);
+                app->mode = AppModeLocked;
+            }
+
+            view_port_update(app->viewport);
+            continue;
+        }
+
+        /*
+         * Recovery import deliberately shows only progress and the currently
+         * selected hexadecimal digit. Previously entered credential material
+         * is not echoed back to the screen.
+         */
+        if(app->mode == AppModeRecoveryImport && short_press) {
+            if(event.key == InputKeyUp) {
+                app->recovery_import_digit =
+                    (uint8_t)((app->recovery_import_digit + 1U) & 0x0FU);
+            } else if(event.key == InputKeyDown) {
+                app->recovery_import_digit =
+                    (uint8_t)((app->recovery_import_digit + 15U) & 0x0FU);
+            } else if(event.key == InputKeyBack) {
+                if(app->recovery_import_length > 0U) {
+                    app->recovery_import_length--;
+                    app->recovery_import[
+                        app->recovery_import_length] = 0U;
+                } else {
+                    clear_recovery_import(app);
+                    app->mode = AppModeProvisionChoice;
+                }
+            } else if(event.key == InputKeyOk) {
+                if(app->recovery_import_length < (HMAC_KEY_SIZE * 2U)) {
+                    app->recovery_import[
+                        app->recovery_import_length++] =
+                        app->recovery_import_digit;
+                }
+
+                if(app->recovery_import_length ==
+                   (HMAC_KEY_SIZE * 2U)) {
+                    if(finish_recovery_import(app)) {
+                        app->mode = AppModeRecoveryImported;
+                    }
+                }
+            }
+
+            view_port_update(app->viewport);
+            continue;
+        }
+
+        if(app->mode == AppModeRecoveryImported && short_press) {
+            if(event.key == InputKeyOk) {
+                app->mode = AppModeAuthorized;
+            } else if(event.key == InputKeyBack) {
+                app->authorized_until = 0U;
+                app->mode = AppModeLocked;
+            }
+
+            view_port_update(app->viewport);
             continue;
         }
 
@@ -1009,16 +1176,19 @@ int32_t keepass_key_app(void* p) {
                         save_state(app);
 
                         /*
-                         * First-run provisioning happens only after the user
-                         * has successfully confirmed their local sequence.
+                         * Local authorization setup is now complete. Key
+                         * provisioning is a separate explicit choice so a new
+                         * installation can either generate a fresh credential
+                         * or restore an existing recovery credential.
                          */
-                        if(!app->hmac_key_provisioned) {
-                            app->hmac_key_provisioned =
-                                provision_hmac_key(app->hmac_key);
-                        }
-
                         clear_entry(app);
-                        app->mode = AppModeLocked;
+                        app->mode = AppModeProvisionChoice;
+
+                        const uint32_t auth_ticks =
+                            (AUTH_TIMEOUT_MS *
+                             furi_kernel_get_tick_frequency()) / 1000U;
+                        app->authorized_until =
+                            furi_get_tick() + auth_ticks;
                     } else {
                         /*
                          * Do not disclose which position differed. Restart the
@@ -1093,6 +1263,7 @@ int32_t keepass_key_app(void* p) {
     furi_message_queue_free(app->input_queue);
 
     memset(app->hmac_key, 0, sizeof(app->hmac_key));
+    memset(app->recovery_import, 0, sizeof(app->recovery_import));
     memset(app->sequence, 0, sizeof(app->sequence));
     memset(app->entry, 0, sizeof(app->entry));
     memset(app, 0, sizeof(KeePassKeyApp));
