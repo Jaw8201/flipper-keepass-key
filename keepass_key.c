@@ -14,10 +14,10 @@
  *   - Temporary authenticated ("armed") state.
  *   - Automatic authorization timeout.
  *   - Manual relocking.
+ *   - HMAC-SHA1 cryptographic self-test.
  *
  * Planned functionality:
  *   - Cryptographic key provisioning and storage.
- *   - HMAC challenge-response.
  *   - USB communication with the host.
  *   - Single-use authorization for each challenge.
  *
@@ -92,6 +92,245 @@ static const InputKey secret_sequence[SEQUENCE_LENGTH] = {
     InputKeyDown,
     InputKeyDown,
 };
+
+
+/* --------------------------------------------------------------------------
+ * SHA-1 / HMAC-SHA1 Development Self-Test
+ * -------------------------------------------------------------------------- */
+
+/**
+ * This implementation exists to establish a deterministic cryptographic
+ * checkpoint before host communication and real key provisioning are added.
+ *
+ * IMPORTANT:
+ * The key and challenge below are PUBLIC RFC 2202 test-vector values.
+ * They are not credentials and MUST NOT be replaced with a real KeePass key
+ * in source control.
+ */
+
+#define SHA1_BLOCK_SIZE 64U
+#define SHA1_DIGEST_SIZE 20U
+
+typedef struct {
+    uint32_t state[5];
+    uint64_t bit_count;
+    uint8_t buffer[SHA1_BLOCK_SIZE];
+    size_t buffer_length;
+} Sha1Context;
+
+static uint32_t sha1_rotl(uint32_t value, uint8_t bits) {
+    return (value << bits) | (value >> (32U - bits));
+}
+
+static void sha1_transform(Sha1Context* ctx, const uint8_t block[SHA1_BLOCK_SIZE]) {
+    uint32_t w[80];
+
+    for(uint8_t i = 0U; i < 16U; i++) {
+        const uint8_t j = (uint8_t)(i * 4U);
+        w[i] = ((uint32_t)block[j] << 24U) |
+               ((uint32_t)block[j + 1U] << 16U) |
+               ((uint32_t)block[j + 2U] << 8U) |
+               ((uint32_t)block[j + 3U]);
+    }
+
+    for(uint8_t i = 16U; i < 80U; i++) {
+        w[i] = sha1_rotl(
+            w[i - 3U] ^ w[i - 8U] ^ w[i - 14U] ^ w[i - 16U],
+            1U);
+    }
+
+    uint32_t a = ctx->state[0];
+    uint32_t b = ctx->state[1];
+    uint32_t c = ctx->state[2];
+    uint32_t d = ctx->state[3];
+    uint32_t e = ctx->state[4];
+
+    for(uint8_t i = 0U; i < 80U; i++) {
+        uint32_t f;
+        uint32_t k;
+
+        if(i < 20U) {
+            f = (b & c) | ((~b) & d);
+            k = 0x5A827999UL;
+        } else if(i < 40U) {
+            f = b ^ c ^ d;
+            k = 0x6ED9EBA1UL;
+        } else if(i < 60U) {
+            f = (b & c) | (b & d) | (c & d);
+            k = 0x8F1BBCDCUL;
+        } else {
+            f = b ^ c ^ d;
+            k = 0xCA62C1D6UL;
+        }
+
+        const uint32_t temp =
+            sha1_rotl(a, 5U) + f + e + k + w[i];
+
+        e = d;
+        d = c;
+        c = sha1_rotl(b, 30U);
+        b = a;
+        a = temp;
+    }
+
+    ctx->state[0] += a;
+    ctx->state[1] += b;
+    ctx->state[2] += c;
+    ctx->state[3] += d;
+    ctx->state[4] += e;
+}
+
+static void sha1_init(Sha1Context* ctx) {
+    ctx->state[0] = 0x67452301UL;
+    ctx->state[1] = 0xEFCDAB89UL;
+    ctx->state[2] = 0x98BADCFEUL;
+    ctx->state[3] = 0x10325476UL;
+    ctx->state[4] = 0xC3D2E1F0UL;
+    ctx->bit_count = 0U;
+    ctx->buffer_length = 0U;
+}
+
+static void sha1_update(Sha1Context* ctx, const uint8_t* data, size_t length) {
+    ctx->bit_count += ((uint64_t)length * 8ULL);
+
+    while(length > 0U) {
+        const size_t available = SHA1_BLOCK_SIZE - ctx->buffer_length;
+        const size_t copy_length = (length < available) ? length : available;
+
+        memcpy(&ctx->buffer[ctx->buffer_length], data, copy_length);
+        ctx->buffer_length += copy_length;
+        data += copy_length;
+        length -= copy_length;
+
+        if(ctx->buffer_length == SHA1_BLOCK_SIZE) {
+            sha1_transform(ctx, ctx->buffer);
+            ctx->buffer_length = 0U;
+        }
+    }
+}
+
+static void sha1_final(Sha1Context* ctx, uint8_t digest[SHA1_DIGEST_SIZE]) {
+    const uint64_t original_bit_count = ctx->bit_count;
+
+    const uint8_t marker = 0x80U;
+    sha1_update(ctx, &marker, 1U);
+
+    const uint8_t zero = 0U;
+    while(ctx->buffer_length != 56U) {
+        sha1_update(ctx, &zero, 1U);
+    }
+
+    uint8_t length_bytes[8];
+    for(uint8_t i = 0U; i < 8U; i++) {
+        length_bytes[7U - i] =
+            (uint8_t)(original_bit_count >> (i * 8U));
+    }
+
+    sha1_update(ctx, length_bytes, sizeof(length_bytes));
+
+    for(uint8_t i = 0U; i < 5U; i++) {
+        digest[(i * 4U)] =
+            (uint8_t)(ctx->state[i] >> 24U);
+        digest[(i * 4U) + 1U] =
+            (uint8_t)(ctx->state[i] >> 16U);
+        digest[(i * 4U) + 2U] =
+            (uint8_t)(ctx->state[i] >> 8U);
+        digest[(i * 4U) + 3U] =
+            (uint8_t)(ctx->state[i]);
+    }
+}
+
+static void hmac_sha1(
+    const uint8_t* key,
+    size_t key_length,
+    const uint8_t* data,
+    size_t data_length,
+    uint8_t output[SHA1_DIGEST_SIZE]) {
+
+    uint8_t normalized_key[SHA1_BLOCK_SIZE] = {0};
+    uint8_t inner_pad[SHA1_BLOCK_SIZE];
+    uint8_t outer_pad[SHA1_BLOCK_SIZE];
+    uint8_t inner_digest[SHA1_DIGEST_SIZE];
+
+    if(key_length > SHA1_BLOCK_SIZE) {
+        Sha1Context key_ctx;
+        sha1_init(&key_ctx);
+        sha1_update(&key_ctx, key, key_length);
+        sha1_final(&key_ctx, normalized_key);
+    } else {
+        memcpy(normalized_key, key, key_length);
+    }
+
+    for(size_t i = 0U; i < SHA1_BLOCK_SIZE; i++) {
+        inner_pad[i] = normalized_key[i] ^ 0x36U;
+        outer_pad[i] = normalized_key[i] ^ 0x5CU;
+    }
+
+    Sha1Context ctx;
+    sha1_init(&ctx);
+    sha1_update(&ctx, inner_pad, sizeof(inner_pad));
+    sha1_update(&ctx, data, data_length);
+    sha1_final(&ctx, inner_digest);
+
+    sha1_init(&ctx);
+    sha1_update(&ctx, outer_pad, sizeof(outer_pad));
+    sha1_update(&ctx, inner_digest, sizeof(inner_digest));
+    sha1_final(&ctx, output);
+
+    /*
+     * These buffers contain only public self-test material at present.
+     * The same cleanup pattern will become mandatory once real key material
+     * is introduced.
+     */
+    memset(normalized_key, 0, sizeof(normalized_key));
+    memset(inner_pad, 0, sizeof(inner_pad));
+    memset(outer_pad, 0, sizeof(outer_pad));
+    memset(inner_digest, 0, sizeof(inner_digest));
+    memset(&ctx, 0, sizeof(ctx));
+}
+
+/**
+ * @brief Verify HMAC-SHA1 against RFC 2202 test case 1.
+ *
+ * Key:       20 bytes of 0x0b
+ * Challenge: ASCII "Hi There"
+ * Expected:  b617318655057264e28bc0b6fb378c8ef146be00
+ *
+ * @return true only when the computed result exactly matches the published
+ *         expected digest.
+ */
+static bool hmac_sha1_self_test(void) {
+    static const uint8_t test_key[20] = {
+        0x0B, 0x0B, 0x0B, 0x0B, 0x0B,
+        0x0B, 0x0B, 0x0B, 0x0B, 0x0B,
+        0x0B, 0x0B, 0x0B, 0x0B, 0x0B,
+        0x0B, 0x0B, 0x0B, 0x0B, 0x0B,
+    };
+
+    static const uint8_t test_challenge[] = "Hi There";
+
+    static const uint8_t expected[SHA1_DIGEST_SIZE] = {
+        0xB6, 0x17, 0x31, 0x86, 0x55,
+        0x05, 0x72, 0x64, 0xE2, 0x8B,
+        0xC0, 0xB6, 0xFB, 0x37, 0x8C,
+        0x8E, 0xF1, 0x46, 0xBE, 0x00,
+    };
+
+    uint8_t result[SHA1_DIGEST_SIZE];
+
+    hmac_sha1(
+        test_key,
+        sizeof(test_key),
+        test_challenge,
+        sizeof(test_challenge) - 1U,
+        result);
+
+    const bool passed =
+        memcmp(result, expected, SHA1_DIGEST_SIZE) == 0;
+
+    memset(result, 0, sizeof(result));
+    return passed;
+}
 
 /* --------------------------------------------------------------------------
  * Persistent State
@@ -213,6 +452,9 @@ typedef struct {
      * handling will consume this authorization once and immediately relock.
      */
     uint32_t authorized_until;
+
+    /** Result of the RFC 2202 HMAC-SHA1 startup self-test. */
+    bool hmac_self_test_passed;
 } KeePassKeyApp;
 
 /* --------------------------------------------------------------------------
@@ -332,8 +574,14 @@ static void draw_callback(Canvas* canvas, void* context) {
      * ------------------------------------------------------------------ */
 
     if(app->unlocked) {
-        canvas_draw_str(canvas, 37, 31, "AUTHORIZED");
-        canvas_draw_str(canvas, 21, 47, "Ready for KeePass");
+        canvas_draw_str(canvas, 37, 27, "AUTHORIZED");
+
+        if(app->hmac_self_test_passed) {
+            canvas_draw_str(canvas, 24, 43, "HMAC TEST: PASS");
+        } else {
+            canvas_draw_str(canvas, 25, 43, "HMAC TEST: FAIL");
+        }
+
         canvas_draw_str(canvas, 27, 61, "BACK to relock");
         return;
     }
@@ -451,6 +699,7 @@ int32_t keepass_key_app(void* p) {
     app->wrong_sequence = false;
     app->locked_until = 0U;
     app->authorized_until = 0U;
+    app->hmac_self_test_passed = hmac_sha1_self_test();
 
     /*
      * Reapply the appropriate delay when the app is reopened after failed
