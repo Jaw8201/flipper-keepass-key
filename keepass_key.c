@@ -55,6 +55,7 @@ typedef enum {
     AppModeRecoveryWarning,
     AppModeRecoveryDisplay,
     AppModeDevHmacTest,
+    AppModeChallengeArmed,
     AppModeProvisionChoice,
     AppModeRecoveryImport,
     AppModeRecoveryImported,
@@ -761,6 +762,18 @@ static void keepass_challenge_cli(PipeSide* pipe, FuriString* args, void* contex
         return;
     }
 
+    /*
+     * A host challenge is accepted only after:
+     *   1. the local arrow sequence has authenticated the user, and
+     *   2. a physical short-OK press has armed exactly one response.
+     *
+     * Merely running the app is therefore no longer enough to obtain HMACs.
+     */
+    if(app->mode != AppModeChallengeArmed) {
+        printf("ERR authorization_required\r\n");
+        return;
+    }
+
     const char* input = furi_string_get_cstr(args);
 
     while(*input == ' ' || *input == '\t') {
@@ -817,6 +830,15 @@ static void keepass_challenge_cli(PipeSide* pipe, FuriString* args, void* contex
         printf("%02X", response[i]);
     }
     printf("\r\n");
+
+    /*
+     * One-use authorization: consume the physical confirmation immediately.
+     * A second host challenge requires the arrow sequence and OK again.
+     */
+    app->authorized_until = 0U;
+    app->mode = AppModeLocked;
+    clear_entry(app);
+    view_port_update(app->viewport);
 
     memset(challenge, 0, sizeof(challenge));
     memset(response, 0, sizeof(response));
@@ -1062,6 +1084,17 @@ static void draw_callback(Canvas* canvas, void* context) {
         return;
     }
 
+    if(app->mode == AppModeChallengeArmed) {
+        /*
+         * Local authentication has succeeded and the user has physically
+         * confirmed one host challenge. No secret material is shown here.
+         */
+        canvas_draw_str(canvas, 30, 20, "USB READY");
+        canvas_draw_str(canvas, 18, 38, "Waiting for challenge");
+        canvas_draw_str(canvas, 24, 56, "BACK to cancel");
+        return;
+    }
+
     if(app->mode == AppModeDevHmacTest) {
         char response_id[9];
         char response_line[24];
@@ -1252,6 +1285,7 @@ int32_t keepass_key_app(void* p) {
 
     while(running) {
         if(app->mode == AppModeAuthorized ||
+           app->mode == AppModeChallengeArmed ||
            app->mode == AppModeDevHmacTest ||
            app->mode == AppModeRecoveryWarning ||
            app->mode == AppModeRecoveryDisplay ||
@@ -1383,7 +1417,11 @@ int32_t keepass_key_app(void* p) {
            event.key == InputKeyOk &&
            short_press &&
            app->hmac_key_provisioned) {
-            app->mode = AppModeDevHmacTest;
+            /*
+             * Physical confirmation. The existing 30-second authorization
+             * deadline is retained; arming does not extend it.
+             */
+            app->mode = AppModeChallengeArmed;
             view_port_update(app->viewport);
             continue;
         }
@@ -1550,7 +1588,8 @@ int32_t keepass_key_app(void* p) {
         }
 
         if(event.key == InputKeyBack) {
-            if(app->mode == AppModeAuthorized) {
+            if(app->mode == AppModeAuthorized ||
+               app->mode == AppModeChallengeArmed) {
                 app->authorized_until = 0U;
                 app->mode = AppModeLocked;
                 clear_entry(app);
