@@ -16,6 +16,7 @@
  *   - Provisioning migration for existing demo installations.
  *   - Authenticated recovery-key display for offline backup.
  *   - Manual recovery-key import for replacement/reprovisioned devices.
+ *   - Short non-secret fingerprint for recovery verification.
  *
  * SECURITY NOTE:
  * This is still development software. The saved directional sequence is local
@@ -628,6 +629,43 @@ static void draw_progress(Canvas* canvas, uint8_t entered, uint8_t total) {
 }
 
 
+
+/**
+ * Derive a short, non-secret identifier for the provisioned credential.
+ *
+ * This is NOT an authentication value and must never be used as one. It exists
+ * only so a user can verify that a restored credential is byte-for-byte the
+ * same as the original without displaying the credential itself.
+ *
+ * The fingerprint is the first four bytes of HMAC-SHA1(key, fixed public
+ * label), displayed as eight hexadecimal characters. Revealing 32 bits of an
+ * HMAC output is acceptable for this development verification purpose, but the
+ * value should still be treated only as an identifier.
+ */
+static void make_key_fingerprint(
+    const uint8_t key[HMAC_KEY_SIZE],
+    char output[9]) {
+
+    static const uint8_t label[] = "KeePass Key fingerprint v1";
+    uint8_t digest[SHA1_DIGEST_SIZE];
+
+    hmac_sha1(
+        key,
+        HMAC_KEY_SIZE,
+        label,
+        sizeof(label) - 1U,
+        digest);
+
+    static const char hex[] = "0123456789ABCDEF";
+    for(uint8_t i = 0U; i < 4U; i++) {
+        output[i * 2U] = hex[(digest[i] >> 4U) & 0x0FU];
+        output[(i * 2U) + 1U] = hex[digest[i] & 0x0FU];
+    }
+    output[8] = '\0';
+
+    memset(digest, 0, sizeof(digest));
+}
+
 /* --------------------------------------------------------------------------
  * Recovery Key Helpers
  * -------------------------------------------------------------------------- */
@@ -832,21 +870,39 @@ static void draw_callback(Canvas* canvas, void* context) {
     }
 
     if(app->mode == AppModeAuthorized) {
-        canvas_draw_str(canvas, 37, 24, "AUTHORIZED");
+        canvas_draw_str(canvas, 37, 20, "AUTHORIZED");
 
         canvas_draw_str(
             canvas,
             24,
-            38,
+            32,
             app->hmac_key_provisioned ? "KEY: PROVISIONED" : "KEY: MISSING");
 
+        if(app->hmac_key_provisioned) {
+            char fingerprint[9];
+            char fingerprint_line[24];
+
+            make_key_fingerprint(app->hmac_key, fingerprint);
+            snprintf(
+                fingerprint_line,
+                sizeof(fingerprint_line),
+                "ID: %s",
+                fingerprint);
+            canvas_draw_str(canvas, 35, 44, fingerprint_line);
+
+            memset(fingerprint, 0, sizeof(fingerprint));
+            memset(fingerprint_line, 0, sizeof(fingerprint_line));
+        } else {
+            canvas_draw_str(canvas, 42, 44, "ID: --------");
+        }
+
         canvas_draw_str(
             canvas,
             24,
-            50,
+            54,
             app->hmac_self_test_passed ? "HMAC TEST: PASS" : "HMAC TEST: FAIL");
 
-        canvas_draw_str(canvas, 6, 63, "Hold OK recovery  BACK");
+        canvas_draw_str(canvas, 6, 64, "Hold OK recovery  BACK");
         return;
     }
 
