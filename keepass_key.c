@@ -19,6 +19,7 @@
  *   - Short non-secret fingerprint for recovery verification.
  *   - Five-minute inactivity timeout while viewing or restoring a recovery key.
  *   - Development challenge-response using the provisioned HMAC credential.
+ *   - Non-consuming USB identity/protocol query for safe host discovery.
  *
  * SECURITY NOTE:
  * This is still development software. The saved directional sequence is local
@@ -716,6 +717,7 @@ static void make_dev_response_id(
  * -------------------------------------------------------------------------- */
 
 #define USB_CHALLENGE_MAX_SIZE 64U
+#define KEEPASS_PROTOCOL_VERSION 1U
 
 /**
  * Convert a single hexadecimal character to a nibble.
@@ -737,6 +739,46 @@ static bool hex_to_nibble(char c, uint8_t* value) {
     }
 
     return false;
+}
+
+/**
+ * Non-consuming host discovery command.
+ *
+ * This command allows the KeePassXC integration to distinguish KeePass Key
+ * from unrelated STM32 USB serial devices without consuming one-use
+ * authorization. The fingerprint is a non-secret identifier derived from the
+ * provisioned HMAC credential; the credential itself is never returned.
+ *
+ * Response when provisioned:
+ *
+ *     OK KEEPASS_KEY <protocol-version> <fingerprint>
+ *
+ * Response when no HMAC credential is present:
+ *
+ *     OK KEEPASS_KEY <protocol-version> UNPROVISIONED
+ */
+static void keepass_info_cli(PipeSide* pipe, FuriString* args, void* context) {
+    UNUSED(pipe);
+    UNUSED(args);
+
+    KeePassKeyApp* app = context;
+
+    if(!app->hmac_key_provisioned) {
+        printf(
+            "OK KEEPASS_KEY %u UNPROVISIONED\r\n",
+            (unsigned int)KEEPASS_PROTOCOL_VERSION);
+        return;
+    }
+
+    char fingerprint[9];
+    make_key_fingerprint(app->hmac_key, fingerprint);
+
+    printf(
+        "OK KEEPASS_KEY %u %s\r\n",
+        (unsigned int)KEEPASS_PROTOCOL_VERSION,
+        fingerprint);
+
+    memset(fingerprint, 0, sizeof(fingerprint));
 }
 
 /**
@@ -1276,6 +1318,12 @@ int32_t keepass_key_app(void* p) {
     CliRegistry* cli_registry = furi_record_open(RECORD_CLI);
     cli_registry_add_command(
         cli_registry,
+        "keepass_info",
+        CliCommandFlagParallelSafe,
+        keepass_info_cli,
+        app);
+    cli_registry_add_command(
+        cli_registry,
         "keepass_challenge",
         CliCommandFlagParallelSafe,
         keepass_challenge_cli,
@@ -1649,6 +1697,7 @@ int32_t keepass_key_app(void* p) {
     memset(app->sequence, 0, sizeof(app->sequence));
     memset(app->entry, 0, sizeof(app->entry));
     memset(app, 0, sizeof(KeePassKeyApp));
+    cli_registry_delete_command(cli_registry, "keepass_info");
     cli_registry_delete_command(cli_registry, "keepass_challenge");
     furi_record_close(RECORD_CLI);
 
