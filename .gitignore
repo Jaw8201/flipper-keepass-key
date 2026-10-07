@@ -1,0 +1,5 @@
+# uFBT build output
+dist/
+
+# Editor-generated files
+.vscode/
